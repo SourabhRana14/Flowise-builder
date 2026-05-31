@@ -1,0 +1,42 @@
+{
+  "name": "agentchain-ui-full",
+  "version": "1.0.0",
+  "scripts": {
+    "prestart": "node scripts/check-node-version.js",
+    "start": "node scripts/start-ui.js",
+    "build": "ng build",
+    "test": "ng test"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=18.13 <21"
+  },
+  "dependencies": {
+    "@angular/animations": "^17.3.12",
+    "@angular/cdk": "^17.3.10",
+    "@angular/common": "^17.3.12",
+    "@angular/compiler": "^17.3.12",
+    "@angular/core": "^17.3.12",
+    "@angular/forms": "^17.3.12",
+    "@angular/material": "^17.3.10",
+    "@angular/platform-browser": "^17.3.12",
+    "@angular/platform-browser-dynamic": "^17.3.12",
+    "@angular/router": "^17.3.12",
+    "@ngrx/effects": "^17.2.0",
+    "@ngrx/entity": "^17.2.0",
+    "@ngrx/store": "^17.2.0",
+    "@ngrx/store-devtools": "^17.2.0",
+    "echarts": "^5.5.1",
+    "ngx-echarts": "^17.2.0",
+    "ngx-monaco-editor-v2": "^17.0.1",
+    "rxjs": "~7.8.1",
+    "tslib": "^2.6.2",
+    "zone.js": "~0.14.10"
+  },
+  "devDependencies": {
+    "@angular-devkit/build-angular": "17.3.11",
+    "@angular/cli": "17.3.11",
+    "@angular/compiler-cli": "17.3.12",
+    "typescript": "~5.4.5"
+  }
+}

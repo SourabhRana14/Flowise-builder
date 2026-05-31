@@ -1,0 +1,199 @@
+<div class="canvas-shell">
+  <header class="builder-topbar">
+    <div class="agent-title">
+      <strong>{{state.agentName || 'Untitled'}}</strong>
+      <button class="tag-button" type="button">{{state.runState.status || 'draft'}}</button>
+      <button mat-icon-button type="button" title="Edit agent name"><mat-icon>edit_square</mat-icon></button>
+    </div>
+    <div class="topbar-actions">
+      <span class="dirty-dot" *ngIf="state.isDirty">Unsaved</span>
+      <button mat-icon-button type="button" title="Preflight" [disabled]="preflightBusy" (click)="runPreflight()"><mat-icon>query_stats</mat-icon></button>
+      <button mat-icon-button type="button" [title]="copilotCommandHidden ? 'Show refine bar' : 'Hide refine bar'" (click)="toggleCopilotCommand()">
+        <mat-icon>{{copilotCommandHidden ? 'auto_fix_high' : 'visibility_off'}}</mat-icon>
+      </button>
+      <button mat-stroked-button type="button" (click)="previewRun()" [disabled]="previewBusy || !refinePrompt.trim()">Agent Preview</button>
+      <button mat-stroked-button type="button" (click)="save()">Share</button>
+      <button mat-flat-button color="primary" type="button" (click)="publish()">Publish</button>
+      <button mat-icon-button type="button" [matMenuTriggerFor]="canvasMenu"><mat-icon>more_vert</mat-icon></button>
+      <mat-menu #canvasMenu="matMenu">
+        <button mat-menu-item (click)="save()"><mat-icon>save</mat-icon><span>Save</span></button>
+        <button mat-menu-item (click)="run()"><mat-icon>play_arrow</mat-icon><span>Run</span></button>
+        <button mat-menu-item (click)="cancelRun()" *ngIf="['pending','running','awaiting_human'].includes(state.runState.status)"><mat-icon>stop</mat-icon><span>Cancel run</span></button>
+        <button mat-menu-item (click)="layoutTopBottom()"><mat-icon>vertical_align_center</mat-icon><span>Auto layout</span></button>
+      </mat-menu>
+    </div>
+  </header>
+
+  <div class="validation" *ngIf="validationErrors.length">
+    <mat-card>
+      <b>Graph validation</b>
+      <ul><li *ngFor="let e of validationErrors">{{e}}</li></ul>
+    </mat-card>
+  </div>
+
+  <div class="layout" [class.palette-collapsed]="paletteCollapsed" [class.config-collapsed]="configCollapsed" [class.logs-collapsed]="logsCollapsed">
+    <div class="palette-panel" [class.collapsed-panel]="paletteCollapsed">
+      <button
+        type="button"
+        class="collapsed-toggle"
+        *ngIf="paletteCollapsed; else paletteExpanded"
+        title="Show node palette"
+        (click)="togglePalette()">
+        <mat-icon>chevron_right</mat-icon>
+        <span>Palette</span>
+      </button>
+      <ng-template #paletteExpanded>
+        <div class="panel-title">
+          <span>Components</span>
+          <button mat-icon-button type="button" title="Hide components" (click)="togglePalette()"><mat-icon>close</mat-icon></button>
+        </div>
+        <app-node-palette (add)="addNode($event)"></app-node-palette>
+      </ng-template>
+    </div>
+
+    <div #canvasWrap class="canvas-wrap" [class.panning]="panning" (mousedown)="panStart($event)" (mousemove)="panMove($event)">
+      <div class="zoom-controls" (click)="$event.stopPropagation()" (mousedown)="$event.stopPropagation()">
+        <button mat-icon-button type="button" title="Zoom out" (click)="zoomOut()">
+          <mat-icon>remove</mat-icon>
+        </button>
+        <button mat-button type="button" class="zoom-value" title="Reset zoom" (click)="resetZoom()">{{zoomPercent}}%</button>
+        <button mat-icon-button type="button" title="Zoom in" (click)="zoomIn()">
+          <mat-icon>add</mat-icon>
+        </button>
+        <span class="zoom-divider"></span>
+        <button mat-icon-button type="button" title="Fit graph to view" (click)="fitToView()">
+          <mat-icon>fit_screen</mat-icon>
+        </button>
+      </div>
+      <div class="board" [style.transform]="transform" (click)="select(null)">
+        <div class="empty-board" *ngIf="!state.nodes.length">
+          <h3>No nodes yet</h3>
+          <p>Add nodes from the palette, or save to create a default START -> LLM -> END graph.</p>
+        </div>
+        <svg class="edges" [attr.width]="2400" [attr.height]="1600">
+          <path *ngFor="let t of toolChildNodes()" class="tool-child-edge" [attr.d]="toolChildPath(t)"></path>
+          <path *ngFor="let a of agentChildNodes()" class="agent-child-edge" [attr.d]="agentChildPath(a)"></path>
+          <path *ngFor="let e of state.edges" class="edge" [class.resource]="edgeType(e) === 'RESOURCE'" [attr.d]="path(e)"></path>
+          <path *ngIf="draft" class="edge draft" [attr.d]="draftPath"></path>
+          <g *ngFor="let e of state.edges" class="edge-label" (click)="$event.stopPropagation()">
+            <rect [attr.x]="mid(e).x - 38" [attr.y]="mid(e).y - 18" width="76" height="26" rx="12"></rect>
+            <text [attr.x]="mid(e).x" [attr.y]="mid(e).y" text-anchor="middle">{{edgeLabel(e)}}</text>
+            <text class="edge-delete" [attr.x]="mid(e).x + 45" [attr.y]="mid(e).y" (click)="removeEdge(e.id)">x</text>
+          </g>
+        </svg>
+
+        <div class="node"
+             *ngFor="let n of state.nodes"
+             [class.selected]="n.id === state.selectedNodeId"
+             [class.active]="n.id === state.runState.activeNodeId"
+             [class.preview]="isPreviewNode(n.id)"
+             [class.preview-missing]="isPreviewMissingNode(n.id)"
+             [class.condition]="n.type === 'CONDITION'"
+             [style.left.px]="n.position.x"
+             [style.top.px]="n.position.y"
+             cdkDrag
+             (cdkDragStarted)="dragStarted(n)"
+             (cdkDragEnded)="moved(n,$event)"
+             (click)="$event.stopPropagation(); select(n.id)">
+          <div class="node-main">
+            <div class="node-icon" [ngClass]="nodeTone(n.type)"><mat-icon>{{nodeIcon(n.type)}}</mat-icon></div>
+            <div class="node-copy">
+              <div class="node-title">{{n.label || defaultLabel(n.type)}}</div>
+              <div class="node-badge" [ngClass]="nodeTone(n.type)"><span></span>{{nodeBadge(n)}}</div>
+            </div>
+          </div>
+
+          <button *ngIf="hasInput(n)" type="button" class="port in" title="Input" (mouseup)="finishConnection(n,$event)"></button>
+          <button *ngIf="hasOutput(n)" type="button" class="port out" title="Drag to connect" (mousedown)="startConnection(n,$event)"></button>
+        </div>
+
+        <div class="tool-child-node"
+             *ngFor="let t of toolChildNodes()"
+             [style.left.px]="t.position.x"
+             [style.top.px]="t.position.y"
+             (click)="$event.stopPropagation(); select(t.parentId)">
+          <div class="tool-child-title">{{t.label}}</div>
+          <div class="tool-child-type">{{t.type}}</div>
+        </div>
+
+        <div class="agent-child-node"
+             *ngFor="let a of agentChildNodes()"
+             [style.left.px]="a.position.x"
+             [style.top.px]="a.position.y"
+             (click)="$event.stopPropagation(); select(a.parentId)">
+          <div class="agent-child-title">{{a.label}}</div>
+          <div class="agent-child-type">{{a.type}}</div>
+        </div>
+      </div>
+
+      <div class="floating-command" *ngIf="!copilotCommandHidden">
+        <button mat-icon-button type="button" class="command-hide" title="Hide refine bar" (click)="toggleCopilotCommand(); $event.stopPropagation()">
+          <mat-icon>keyboard_arrow_down</mat-icon>
+        </button>
+        <mat-form-field appearance="outline">
+          <mat-label>Refine or preview this agent</mat-label>
+          <input matInput [(ngModel)]="refinePrompt" placeholder="Add a guardrail before external writes">
+        </mat-form-field>
+        <button mat-flat-button color="primary" [disabled]="refineBusy || !refinePrompt.trim()" (click)="refineWithCopilot(); $event.stopPropagation()">
+          <mat-icon>auto_fix_high</mat-icon>{{ refineBusy ? 'Applying' : 'Apply' }}
+        </button>
+      </div>
+      <button class="floating-command-show" type="button" *ngIf="copilotCommandHidden" (click)="toggleCopilotCommand(); $event.stopPropagation()">
+        <mat-icon>auto_fix_high</mat-icon>
+        <span>Copilot</span>
+      </button>
+      <div class="canvas-help">
+        Drag components. Connect nodes through the side ports. Mouse wheel pans, Ctrl+wheel zooms.
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="config-shell" [class.collapsed-panel]="configCollapsed">
+        <button type="button" class="collapsed-toggle horizontal" *ngIf="configCollapsed; else configExpanded" title="Show parameters" (click)="toggleConfig()">
+          <mat-icon>expand_more</mat-icon>
+          <span>Inspector</span>
+        </button>
+        <ng-template #configExpanded>
+          <div class="inspector-header">
+            <div>
+              <h2><mat-icon>{{selectedNode ? nodeIcon(selectedNode.type) : 'tune'}}</mat-icon>{{selectedInspectorTitle()}}</h2>
+              <p>{{selectedInspectorSubtitle()}}</p>
+            </div>
+            <div class="inspector-actions">
+              <button mat-icon-button type="button" title="Attach to orchestrator" [disabled]="!canAttachSelectedResource()" (click)="attachSelectedToOrchestrator()"><mat-icon>account_tree</mat-icon></button>
+              <button mat-icon-button type="button" title="Hide inspector" (click)="toggleConfig()"><mat-icon>close</mat-icon></button>
+            </div>
+          </div>
+          <app-config-panel [node]="selectedNode" (save)="saveConfig($event)" (remove)="removeNode($event)"></app-config-panel>
+        </ng-template>
+      </div>
+      <mat-card class="logs" [class.collapsed-panel]="logsCollapsed" *ngIf="state.runState.stepLog.length || preflightMessages.length || previewMessages.length || refineMessage">
+        <button type="button" class="collapsed-toggle horizontal" *ngIf="logsCollapsed; else logsExpanded" title="Show step log" (click)="toggleLogs()">
+          <mat-icon>expand_more</mat-icon>
+          <span>Step Log</span>
+        </button>
+        <ng-template #logsExpanded>
+        <div class="panel-title">
+          <span>Execution Preview</span>
+          <button mat-icon-button type="button" title="Hide step log" (click)="toggleLogs()"><mat-icon>expand_less</mat-icon></button>
+        </div>
+        <div class="preflight" *ngIf="preflightMessages.length || previewMessages.length || refineMessage">
+          <div *ngIf="refineMessage" class="preflight-info">{{refineMessage}}</div>
+          <div *ngFor="let item of preflightMessages" [class.error]="item.level === 'error'" [class.warn]="item.level === 'warning'" [class.info]="item.level === 'info'">
+            <b>{{item.level | uppercase}}</b> {{item.message}}
+          </div>
+          <div *ngFor="let item of previewMessages" class="preview-line">
+            <b>{{item.label}}</b> {{item.message}}
+          </div>
+        </div>
+        <div *ngFor="let l of state.runState.stepLog" class="step-row">
+          <b>{{l.nodeId}}</b>
+          <p>{{l.preview}}</p>
+          <small>{{l.ts}}</small>
+        </div>
+        <p class="error" *ngIf="state.runState.errorMsg">{{state.runState.errorMsg}}</p>
+        </ng-template>
+      </mat-card>
+    </aside>
+  </div>
+</div>
