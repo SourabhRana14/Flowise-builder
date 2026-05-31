@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv311/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# Node
+node_modules/
+dist/
+.cache/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+desktop.ini
+Thumbs.db
+
+# Documentation (temporary analysis files)
+BLUEPRINT_VS_IMPLEMENTATION.md
+DETAILED_IMPLEMENTATION_ANALYSIS.md
+IMPLEMENTATION_STATUS.md
+INTEGRATION_COMPLETE.md
+
+# Build outputs
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend build
+pg/dist/
+pg/build/
+pg/.vite/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Word documents (blueprint)
+*.docx
+*.doc
+
+# Angular (if not needed)
+pg/agentchain-ui-full/
+
+# Package files
+pg/package-lock.json
+backend/__pycache__/
