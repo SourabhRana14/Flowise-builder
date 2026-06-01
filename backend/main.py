@@ -91,6 +91,26 @@ class Tool(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_by = Column(String)
 
+class ConversationSession(Base):
+    __tablename__ = "conversation_sessions"
+    
+    id = Column(String, primary_key=True)
+    agent_id = Column(String, nullable=False)
+    user_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_active = Column(DateTime, default=datetime.utcnow)
+    metadata = Column(JSON, default={})
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+    
+    id = Column(String, primary_key=True)
+    session_id = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    metadata = Column(JSON, default={})
+
 # Create tables
 Base.metadata.create_all(bind=engine)
 
@@ -141,7 +161,9 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     agent_id: str
     messages: List[ChatMessage]
-    providers: Optional[Dict[str, Any]] = None  # Provider configurations from Models Panel
+    providers: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None  # Add session support
+    user_id: Optional[str] = None  # Provider configurations from Models Panel
 
 class ToolCreate(BaseModel):
     name: str
@@ -295,10 +317,11 @@ async def delete_agent(agent_id: str, db: Session = Depends(get_db)):
 
 # ==================== AGENT EXECUTION ====================
 
-async def execute_agent(agent_id: str, input_message: str, providers_config: Dict[str, Any], db: Session):
-    """Execute agent workflow using LangGraph"""
+async def execute_agent(agent_id: str, input_message: str, providers_config: Dict[str, Any], db: Session, session_id: Optional[str] = None):
+    """Execute agent workflow using LangGraph with conversation memory"""
     import uuid
     from workflow_executor import execute_workflow
+    from memory_manager import MemoryManager
     
     print(f"\n🔑 Providers config received: {providers_config}")
     
@@ -306,6 +329,13 @@ async def execute_agent(agent_id: str, input_message: str, providers_config: Dic
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Get conversation context if session exists
+    context_messages = []
+    if session_id:
+        memory = MemoryManager(db)
+        context_messages = memory.get_context(session_id, window_size=10)
+        print(f"📚 Loaded {len(context_messages)} messages from memory")
     
     # Inject provider API keys into workflow nodes
     workflow = agent.workflow.copy()
@@ -353,7 +383,7 @@ async def execute_agent(agent_id: str, input_message: str, providers_config: Dic
         print(f"📊 Workflow: {len(workflow.get('nodes', []))} nodes, {len(workflow.get('edges', []))} edges")
         
         # Execute using LangGraph
-        result = await execute_workflow(workflow, input_message)
+        result = await execute_workflow(workflow, input_message, db_session=db, context_messages=context_messages)
         
         output = result['output']
         trace = result['trace']
@@ -387,14 +417,36 @@ async def execute_agent(agent_id: str, input_message: str, providers_config: Dic
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """Chat with agent"""
+    """Chat with agent with conversation memory"""
+    from memory_manager import MemoryManager
+    
+    # Initialize memory manager
+    memory = MemoryManager(db)
+    
+    # Get or create session
+    session_id = memory.get_or_create_session(
+        agent_id=request.agent_id,
+        session_id=request.session_id,
+        user_id=request.user_id
+    )
+    
+    # Get last user message
     last_message = request.messages[-1].content if request.messages else ""
+    
+    # Add user message to memory
+    memory.add_message(session_id, 'user', last_message)
+    
+    # Execute agent
     providers_config = request.providers or {}
-    response = await execute_agent(request.agent_id, last_message, providers_config, db)
+    response = await execute_agent(request.agent_id, last_message, providers_config, db, session_id=session_id)
+    
+    # Add assistant response to memory
+    memory.add_message(session_id, 'assistant', response)
     
     return {
         "response": response,
-        "role": "assistant"
+        "role": "assistant",
+        "session_id": session_id  # Return session ID to frontend
     }
 
 @app.post("/api/chat/stream")
@@ -623,31 +675,47 @@ async def test_tool(tool_id: str, test_request: ToolTestRequest, db: Session = D
     config = tool.config
     url = config.get('url', '')
     method = config.get('method', 'GET').upper()
-    headers = config.get('headers', {})
+    headers_raw = config.get('headers', [])
     body = config.get('body', {})
     auth_type = config.get('authType', 'none')
     auth_value = config.get('authValue', '')
+    
+    # Convert headers from list format to dict
+    headers = {}
+    if isinstance(headers_raw, list):
+        for header in headers_raw:
+            if isinstance(header, dict) and 'key' in header and 'value' in header:
+                headers[header['key']] = header['value']
+    elif isinstance(headers_raw, dict):
+        headers = headers_raw
     
     print(f"  📍 URL: {url}")
     print(f"  📋 Method: {method}")
     print(f"  🔑 Auth: {auth_type}")
     
+    # Prepare query parameters
+    params = {}
+    
     # Add authentication
     if auth_type == 'bearer' and auth_value:
         headers['Authorization'] = f'Bearer {auth_value}'
     elif auth_type == 'apikey' and auth_value:
-        headers['X-API-Key'] = auth_value
+        # For API key, add to query params (common for weather APIs)
+        params['appid'] = auth_value
     elif auth_type == 'basic' and auth_value:
         headers['Authorization'] = f'Basic {auth_value}'
     
-    # Merge test parameters with body
+    # Merge test parameters with params for GET, body for POST
     if test_request.parameters:
-        body.update(test_request.parameters)
+        if method == 'GET':
+            params.update(test_request.parameters)
+        else:
+            body.update(test_request.parameters)
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             if method == 'GET':
-                response = await client.get(url, headers=headers, params=body)
+                response = await client.get(url, headers=headers, params=params)
             elif method == 'POST':
                 response = await client.post(url, headers=headers, json=body)
             elif method == 'PUT':

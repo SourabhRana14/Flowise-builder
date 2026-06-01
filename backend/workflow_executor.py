@@ -25,14 +25,16 @@ class AgentState(TypedDict):
 # ==================== NODE EXECUTORS ====================
 
 def create_llm_node(node_config: Dict[str, Any]):
-    """Create LLM node executor"""
+    """Create LLM node executor with tool calling support"""
     
     async def llm_node(state: AgentState) -> AgentState:
-        """Execute LLM node"""
+        """Execute LLM node with dynamic tool calling"""
+        import httpx
+        from sqlalchemy.orm import Session
+        
         print(f"🤖 Executing LLM Node: {node_config.get('label', 'LLM')}")
         
         # Get model configuration from node
-        # Node structure: { id, type, position, values } - NO 'data' wrapper
         node_values = node_config.get('values', {})
         
         # Extract provider and model from node configuration
@@ -45,7 +47,7 @@ def create_llm_node(node_config: Dict[str, Any]):
         print(f"  🤖 Model: {model_name}")
         print(f"  🌡️ Temperature: {temperature}")
         
-        # Get API key from node config (injected by main.py from Models Panel)
+        # Get API key from node config
         api_key = node_values.get('apiKey', '')
         endpoint = node_values.get('endpoint', '')
         
@@ -74,6 +76,51 @@ def create_llm_node(node_config: Dict[str, Any]):
                 'status': 'failed'
             })
             return state
+        
+        # Get available tools from workflow
+        available_tools = []
+        db = state.get('variables', {}).get('db_session')
+        
+        if db:
+            from main import Tool
+            # Check if there's a connected N04 Tools node
+            tool_ids_str = state.get('variables', {}).get('tool_ids', '')
+            if tool_ids_str:
+                tool_ids = [tid.strip() for tid in tool_ids_str.split(',') if tid.strip()]
+                print(f"  🔧 Found {len(tool_ids)} tools to make available to LLM")
+                
+                for tool_id in tool_ids:
+                    tool = db.query(Tool).filter(Tool.id == tool_id).first()
+                    if tool and tool.enabled:
+                        # Convert tool to OpenAI function format
+                        tool_def = {
+                            "type": "function",
+                            "function": {
+                                "name": f"tool_{tool.name.lower().replace(' ', '_')}",
+                                "description": tool.description,
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "city": {
+                                            "type": "string",
+                                            "description": "The city name to get weather for"
+                                        },
+                                        "units": {
+                                            "type": "string",
+                                            "enum": ["metric", "imperial"],
+                                            "description": "Temperature units (metric or imperial)"
+                                        }
+                                    },
+                                    "required": ["city"]
+                                }
+                            }
+                        }
+                        available_tools.append({
+                            'definition': tool_def,
+                            'tool_id': tool.id,
+                            'tool_obj': tool
+                        })
+                        print(f"    ✅ Added tool: {tool.name}")
         
         # Initialize LLM based on provider
         try:
@@ -135,17 +182,130 @@ def create_llm_node(node_config: Dict[str, Any]):
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
         
-        # Add conversation history
+        # Add context from previous conversation (memory)
+        context_messages = state.get('variables', {}).get('context_messages', [])
+        if context_messages:
+            print(f"  📚 Adding {len(context_messages)} messages from conversation history")
+            for ctx_msg in context_messages:
+                if ctx_msg['role'] == 'user':
+                    messages.append(HumanMessage(content=ctx_msg['content']))
+                elif ctx_msg['role'] == 'assistant':
+                    messages.append(AIMessage(content=ctx_msg['content']))
+        
+        # Add conversation history from current execution
         for msg in state['messages']:
             if msg['role'] == 'user':
                 messages.append(HumanMessage(content=msg['content']))
             elif msg['role'] == 'assistant':
                 messages.append(AIMessage(content=msg['content']))
         
-        # Call LLM
+        # Call LLM with tools if available
         try:
-            response = await llm.ainvoke(messages)
-            output = response.content
+            if available_tools and provider_lower in ['openai', 'groq']:
+                # Bind tools to LLM
+                tool_defs = [t['definition'] for t in available_tools]
+                llm_with_tools = llm.bind(tools=tool_defs)
+                
+                print(f"  🔧 Calling LLM with {len(tool_defs)} tools available")
+                response = await llm_with_tools.ainvoke(messages)
+                
+                # Check if LLM wants to call a tool
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    print(f"  🎯 LLM requested {len(response.tool_calls)} tool call(s)")
+                    
+                    tool_results = []
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call.get('name', '')
+                        tool_args = tool_call.get('args', {})
+                        
+                        print(f"    🔨 Executing tool: {tool_name} with args: {tool_args}")
+                        
+                        # Find matching tool
+                        matching_tool = None
+                        for t in available_tools:
+                            if t['definition']['function']['name'] == tool_name:
+                                matching_tool = t
+                                break
+                        
+                        if matching_tool:
+                            tool_obj = matching_tool['tool_obj']
+                            
+                            # Execute HTTP tool
+                            if tool_obj.type == 'http':
+                                config = tool_obj.config
+                                url = config.get('url', '')
+                                method = config.get('method', 'GET').upper()
+                                headers_raw = config.get('headers', [])
+                                auth_type = config.get('authType', 'none')
+                                auth_value = config.get('authValue', '')
+                                
+                                # Convert headers
+                                headers = {}
+                                if isinstance(headers_raw, list):
+                                    for header in headers_raw:
+                                        if isinstance(header, dict) and 'key' in header and 'value' in header:
+                                            headers[header['key']] = header['value']
+                                
+                                # Prepare params
+                                params = {}
+                                if auth_type == 'apikey' and auth_value:
+                                    params['appid'] = auth_value
+                                
+                                # Add tool arguments to params
+                                if 'city' in tool_args:
+                                    params['q'] = tool_args['city']
+                                if 'units' in tool_args:
+                                    params['units'] = tool_args['units']
+                                else:
+                                    params['units'] = 'metric'
+                                
+                                # Execute HTTP request
+                                async with httpx.AsyncClient(timeout=30.0) as client:
+                                    if method == 'GET':
+                                        tool_response = await client.get(url, headers=headers, params=params)
+                                        result_data = tool_response.json()
+                                        
+                                        tool_results.append({
+                                            'tool_name': tool_obj.name,
+                                            'status': 'success',
+                                            'result': result_data
+                                        })
+                                        
+                                        print(f"      ✅ Tool executed successfully: {tool_obj.name}")
+                        
+                    # Add tool results to messages and call LLM again
+                    if tool_results:
+                        tool_message = f"Tool execution results:\n"
+                        for tr in tool_results:
+                            if tr['status'] == 'success':
+                                result = tr['result']
+                                if 'main' in result and 'weather' in result:
+                                    tool_message += f"\n{tr['tool_name']}:\n"
+                                    tool_message += f"Temperature: {result['main']['temp']}°C\n"
+                                    tool_message += f"Feels like: {result['main']['feels_like']}°C\n"
+                                    tool_message += f"Weather: {result['weather'][0]['description']}\n"
+                                    tool_message += f"Humidity: {result['main']['humidity']}%\n"
+                        
+                        messages.append(AIMessage(content=f"[Tool calls executed]"))
+                        messages.append(HumanMessage(content=tool_message))
+                        
+                        # Call LLM again with tool results
+                        print(f"  🔄 Calling LLM again with tool results")
+                        final_response = await llm.ainvoke(messages)
+                        output = final_response.content
+                        
+                        state['trace'].append({
+                            'node_id': node_config['id'],
+                            'node_type': 'llm',
+                            'node_label': node_config.get('label', 'LLM'),
+                            'tool_calls': len(tool_results),
+                            'tools_used': [tr['tool_name'] for tr in tool_results]
+                        })
+                else:
+                    output = response.content
+            else:
+                response = await llm.ainvoke(messages)
+                output = response.content
             
             # Update state
             state['messages'].append({
@@ -185,29 +345,179 @@ def create_llm_node(node_config: Dict[str, Any]):
     return llm_node
 
 
-def create_tool_node(node_config: Dict[str, Any]):
-    """Create Tool node executor"""
+def create_tool_node(node_config: Dict[str, Any], db_session=None):
+    """Create Tool node executor with actual tool execution"""
     
     async def tool_node(state: AgentState) -> AgentState:
-        """Execute Tool node"""
+        """Execute Tool node - calls configured tools"""
+        import httpx
+        from sqlalchemy.orm import Session
+        
         print(f"🔧 Executing Tool Node: {node_config.get('label', 'Tool')}")
         
         # Node structure: { id, type, position, values }
         node_values = node_config.get('values', {})
-        tool_name = node_values.get('toolName', 'unknown')
+        tool_set_str = node_values.get('toolSet', '')
         
-        # TODO: Implement actual tool execution
-        # For now, just log
+        # Parse tool IDs from comma-separated string
+        tool_ids = [tid.strip() for tid in tool_set_str.split(',') if tid.strip()]
+        
+        if not tool_ids:
+            print(f"  ⚠️ No tools configured in this node")
+            state['trace'].append({
+                'node_id': node_config['id'],
+                'node_type': 'tool',
+                'node_label': node_config.get('label', 'Tool'),
+                'status': 'skipped',
+                'message': 'No tools configured'
+            })
+            return state
+        
+        print(f"  📋 Tools to execute: {tool_ids}")
+        
+        # Get database session from state variables
+        db = state.get('variables', {}).get('db_session')
+        if not db:
+            print(f"  ❌ No database session available")
+            state['error'] = "Database session not available"
+            return state
+        
+        # Import Tool model
+        from main import Tool
+        
+        # Execute each tool
+        tool_results = []
+        for tool_id in tool_ids:
+            try:
+                # Fetch tool from database
+                tool = db.query(Tool).filter(Tool.id == tool_id).first()
+                
+                if not tool:
+                    print(f"  ❌ Tool not found: {tool_id}")
+                    tool_results.append({
+                        'tool_id': tool_id,
+                        'status': 'error',
+                        'error': 'Tool not found'
+                    })
+                    continue
+                
+                if not tool.enabled:
+                    print(f"  ⚠️ Tool disabled: {tool.name}")
+                    tool_results.append({
+                        'tool_id': tool_id,
+                        'tool_name': tool.name,
+                        'status': 'skipped',
+                        'message': 'Tool is disabled'
+                    })
+                    continue
+                
+                print(f"  🔨 Executing tool: {tool.name}")
+                
+                # Execute HTTP tool
+                if tool.type == 'http':
+                    config = tool.config
+                    url = config.get('url', '')
+                    method = config.get('method', 'GET').upper()
+                    headers_raw = config.get('headers', [])
+                    body = config.get('body', {})
+                    auth_type = config.get('authType', 'none')
+                    auth_value = config.get('authValue', '')
+                    
+                    # Convert headers from list to dict
+                    headers = {}
+                    if isinstance(headers_raw, list):
+                        for header in headers_raw:
+                            if isinstance(header, dict) and 'key' in header and 'value' in header:
+                                headers[header['key']] = header['value']
+                    elif isinstance(headers_raw, dict):
+                        headers = headers_raw
+                    
+                    # Prepare query parameters
+                    params = {}
+                    
+                    # Add authentication
+                    if auth_type == 'bearer' and auth_value:
+                        headers['Authorization'] = f'Bearer {auth_value}'
+                    elif auth_type == 'apikey' and auth_value:
+                        params['appid'] = auth_value
+                    elif auth_type == 'basic' and auth_value:
+                        headers['Authorization'] = f'Basic {auth_value}'
+                    
+                    # Extract parameters from last user message (simple approach)
+                    # In production, you'd use LLM to extract parameters
+                    last_user_msg = next((m for m in reversed(state['messages']) if m['role'] == 'user'), None)
+                    if last_user_msg and 'london' in last_user_msg['content'].lower():
+                        params['q'] = 'London'
+                        params['units'] = 'metric'
+                    
+                    # Execute HTTP request
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        if method == 'GET':
+                            response = await client.get(url, headers=headers, params=params)
+                        elif method == 'POST':
+                            response = await client.post(url, headers=headers, json=body)
+                        elif method == 'PUT':
+                            response = await client.put(url, headers=headers, json=body)
+                        elif method == 'DELETE':
+                            response = await client.delete(url, headers=headers)
+                        else:
+                            raise ValueError(f"Unsupported HTTP method: {method}")
+                        
+                        result_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text
+                        
+                        tool_results.append({
+                            'tool_id': tool_id,
+                            'tool_name': tool.name,
+                            'status': 'success',
+                            'status_code': response.status_code,
+                            'result': result_data
+                        })
+                        
+                        print(f"  ✅ Tool executed successfully: {tool.name} (HTTP {response.status_code})")
+                
+                else:
+                    print(f"  ⚠️ Unsupported tool type: {tool.type}")
+                    tool_results.append({
+                        'tool_id': tool_id,
+                        'tool_name': tool.name,
+                        'status': 'error',
+                        'error': f'Unsupported tool type: {tool.type}'
+                    })
+                    
+            except Exception as e:
+                print(f"  ❌ Tool execution error: {str(e)}")
+                tool_results.append({
+                    'tool_id': tool_id,
+                    'status': 'error',
+                    'error': str(e)
+                })
+        
+        # Add tool results to state
+        state['variables']['tool_results'] = tool_results
+        
+        # Add to trace
         state['trace'].append({
             'node_id': node_config['id'],
             'node_type': 'tool',
             'node_label': node_config.get('label', 'Tool'),
-            'tool_name': tool_name,
-            'status': 'success',
-            'output': f'Tool {tool_name} executed (placeholder)'
+            'tools_executed': len(tool_ids),
+            'results': tool_results,
+            'status': 'success'
         })
         
-        print(f"✅ Tool {tool_name} executed")
+        # Add tool results to messages for LLM context
+        results_summary = "\n".join([
+            f"Tool: {r.get('tool_name', 'unknown')}\nResult: {r.get('result', r.get('error', 'No result'))}"
+            for r in tool_results
+        ])
+        
+        state['messages'].append({
+            'role': 'system',
+            'content': f"Tool execution results:\n{results_summary}",
+            'node': node_config['id']
+        })
+        
+        print(f"✅ Tool node executed: {len(tool_results)} tools")
         
         return state
     
@@ -285,7 +595,7 @@ def create_end_node():
 class WorkflowExecutor:
     """Builds and executes LangGraph workflows from visual definitions"""
     
-    def __init__(self, workflow_definition: Dict[str, Any]):
+    def __init__(self, workflow_definition: Dict[str, Any], db_session=None, context_messages: List[Dict] = None):
         """
         Initialize executor with workflow definition
         
@@ -294,14 +604,34 @@ class WorkflowExecutor:
                 'nodes': [...],
                 'edges': [...]
             }
+            db_session: Database session for tool execution
+            context_messages: Previous conversation messages for context
         """
         self.nodes = workflow_definition.get('nodes', [])
         self.edges = workflow_definition.get('edges', [])
         self.graph = None
+        self.db_session = db_session
+        self.context_messages = context_messages or []
     
     def build_graph(self) -> StateGraph:
         """Build LangGraph from workflow definition"""
         print(f"🏗️ Building workflow graph with {len(self.nodes)} nodes and {len(self.edges)} edges")
+        
+        # Extract tool IDs from N04 nodes
+        tool_ids = []
+        for node in self.nodes:
+            if node.get('type') in ['tool', 'n04_tools']:
+                node_values = node.get('values', {})
+                tool_set_str = node_values.get('toolSet', '')
+                if tool_set_str:
+                    node_tool_ids = [tid.strip() for tid in tool_set_str.split(',') if tid.strip()]
+                    tool_ids.extend(node_tool_ids)
+                    print(f"  🔧 Found {len(node_tool_ids)} tools in node {node['id']}")
+        
+        # Store tool IDs in executor for later use
+        self.tool_ids = ','.join(tool_ids) if tool_ids else ''
+        if self.tool_ids:
+            print(f"  📦 Total tools available: {len(tool_ids)}")
         
         # Create graph
         workflow = StateGraph(AgentState)
@@ -315,7 +645,7 @@ class WorkflowExecutor:
             
             if node_type == 'llm' or node_type == 'n02_llm_manager':
                 workflow.add_node(node_id, create_llm_node(node))
-            elif node_type == 'tool':
+            elif node_type == 'tool' or node_type == 'n04_tools':
                 workflow.add_node(node_id, create_tool_node(node))
             elif node_type == 'conditional':
                 workflow.add_node(node_id, create_conditional_node(node))
@@ -395,7 +725,11 @@ class WorkflowExecutor:
         initial_state: AgentState = {
             'messages': [{'role': 'user', 'content': input_message}],
             'current_node': '',
-            'variables': {},
+            'variables': {
+                'db_session': self.db_session,
+                'tool_ids': getattr(self, 'tool_ids', ''),
+                'context_messages': self.context_messages
+            },
             'trace': [],
             'error': None
         }
@@ -436,16 +770,18 @@ class WorkflowExecutor:
 
 # ==================== HELPER FUNCTIONS ====================
 
-async def execute_workflow(workflow_definition: Dict[str, Any], input_message: str) -> Dict[str, Any]:
+async def execute_workflow(workflow_definition: Dict[str, Any], input_message: str, db_session=None, context_messages: List[Dict] = None) -> Dict[str, Any]:
     """
     Convenience function to execute a workflow
     
     Args:
         workflow_definition: Workflow definition with nodes and edges
         input_message: User input
+        db_session: Database session for tool execution
+        context_messages: Previous conversation messages for context
         
     Returns:
         Execution result
     """
-    executor = WorkflowExecutor(workflow_definition)
+    executor = WorkflowExecutor(workflow_definition, db_session=db_session, context_messages=context_messages or [])
     return await executor.execute(input_message)

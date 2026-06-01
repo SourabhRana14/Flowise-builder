@@ -284,7 +284,7 @@ export const NODE_CATEGORIES = [
           'Full execution audit trail',
         ],
         fields: [
-          { key: 'toolSet', label: 'Tool Set', type: 'textarea', default: 'CRM lookup, ticket creation, calendar booking, email, web search' },
+          { key: 'toolSet', label: 'Tool Set', type: 'textarea', default: '' },
           { key: 'executionMode', label: 'Execution Mode', type: 'select', options: ['Sequential', 'Parallel', 'Hybrid'], default: 'Hybrid' },
           { key: 'permissionScope', label: 'Permission Scope', type: 'select', options: ['Per Agent + User Role', 'Per Agent', 'Admin Only'], default: 'Per Agent + User Role' },
           { key: 'timeoutSeconds', label: 'Timeout Seconds', type: 'number', default: '30' },
